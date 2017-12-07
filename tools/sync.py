@@ -249,6 +249,7 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
         logging.info('getheader json loads exception,%s,%s, %s' % (block_height, e, res))
         raise HeaderNotFound('header %s not found' % block_height)
     hash_ = res['result']['hash']
+    previous_block_hash = res['result']['previous_block_hash']
 
     block_ = get_block(rpc, hash_, 'true')
     block_ = json.loads(block_)
@@ -400,7 +401,7 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
         transactions.append(transactions_)
         tx_id += 1
 
-    return block, transactions, addresses_, outs, asset_outs, inputs, new_txs
+    return block, transactions, addresses_, outs, asset_outs, inputs, new_txs, previous_block_hash
 
 
 def process_batch(db_chain, batch_info):
@@ -466,35 +467,30 @@ def clear_fork(db_chain, fork_height):
     db_chain.output.remove({'output_id':{'$in':tx_output_ids}})
 
 
-def process_fork(db_chain, rpc, current_height):
-    height = current_height
-    # if height % 20 > 0:
-    #     return
-
+def process_fork (db_chain, rpc, current_height, previous_block_hash):
     def check_block(hash_):
         b = db_chain.block.find({'hash':hash_})
         return not not b.count()
 
     fork_height = -1
-    while True:
-        try:
+    height = current_height
+
+    while height > 0:
+        height -= 1
+        if previous_block_hash == null_hash:
             header = get_header(rpc, height)
             header = json.loads(header)
-            hash = header['result']['hash']
-
-            # if height % 10 == 9:
-            #     hash = 'fuck'
+            hash   = header['result']['hash']
+            #previous_block_hash = res['result']['previous_block_hash']
+        else:
+            hash = previous_block_hash
+            previous_block_hash = null_hash
+        try:
             existed = check_block(hash)
             if not existed:
                 fork_height = height
             else:
-                if current_height == height:
-                    height -= 1
-                    continue
                 break
-            if height == 1:
-                break
-            height -= 1
         except Exception as e:
             logging.info('process fork exception,%s,%s' % (e, height))
             break
@@ -553,11 +549,12 @@ def workaholic(stopped):
 
     while not stopped():
         block_height = -1
+        previous_block_hash = null_hash
         try:
             block_height, tx_id, o_id, i_id = get_last_height(db_chain)
             if last_height == block_height:
                 time.sleep(1)
-            block, transactions, addresses_, outs, asset_outs, inputs, new_txs = sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc)
+            block, transactions, addresses_, outs, asset_outs, inputs, new_txs, previous_block_hash = sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc)
             output_line = 'block,%s, tx,%s,address,%s, output,%s, input, %s' % \
                           (block['number'], len(transactions), len(addresses_), len(outs), len(inputs))
 
@@ -578,7 +575,7 @@ def workaholic(stopped):
             break
         except int as e:
             logging.error('workholic exception,%s' % e)
-        process_fork(db_chain, rpc, block_height)
+        process_fork(db_chain, rpc, block_height, previous_block_hash)
         if block_height > 0:
             last_height = block_height
 
