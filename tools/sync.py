@@ -435,13 +435,13 @@ def get_last_height(db_chain):
     return block_height.next()['number'] + 1 if block_height_count > 0  else 0\
         , max_tx_id.next()['tx_id'] + 1 if max_tx_id.count() > 0 else 0\
         , max_output_id.next()['output_id'] + 1 if max_output_id.count() > 0 else 0\
-        , max_input_id.next()['input_id'] + 1if max_input_id.count() > 0 else 0
+        , max_input_id.next()['input_id'] + 1 if max_input_id.count() > 0 else 0
 
 def get_last_block_inputs(db_chain):
     block_height = db_chain.block.aggregate([{"$group":{"_id": "max-height","max_height":{"$max":"$number"}}}]).next()["max_height"]
     latest_block_tx_ids_cur = db_chain.transaction.find({"block_height":block_height})
     latest_block_tx_ids = [txs['tx_id'] for txs in latest_block_tx_ids_cur]
-    latest_block_inputs = db_chain.input.find({"tx_id":{"$in":latest_block_tx_ids}})
+    latest_block_inputs = db_chain.input.find({"tx_id":{"$in":latest_block_tx_ids}}).sort("input_id", -1)
 
     return block_height, len(latest_block_tx_ids), latest_block_inputs
 
@@ -542,8 +542,8 @@ def workaholic(stopped):
     # check latest block inputs spend outputs
     logging.info("======================== utxo check ======================")
     int_block_height, int_block_txs, int_inputs = get_last_block_inputs(db_chain)
-    processed_modified, processed_utxo, processed_total = process_utxo(db_chain, int_inputs, with_log = False)
-    logging.info("utxo: %s inputs in %s txs at block %s, %s/%s/%s(modified/proessed/total) outputs processed at startup." %(int_inputs.count(), int_block_txs, int_block_height, processed_modified, processed_utxo, processed_total))
+    processed_modified, processed_utxo, processed_total = process_utxo(db_chain, int_inputs, with_log = False, no_modify_exit = True)
+    logging.info("utxo: %s inputs in %s txs at block %s, %s/%s/%s(modified/proessed/total) outputs processed at startup." %(int_inputs.count(), int_block_txs, int_block_height, processed_modified, processed_utxo, int_inputs.count()))
 
     addresses = latest_addresses(db_chain)
 
@@ -595,7 +595,7 @@ def do_fork(args):
     db_chain = new_mongo(mongodb_host, mongodb_port, db_name)
     clear_fork(db_chain, int(args[0]))
 
-def process_utxo(db_chain, inputs, unmark = False, with_log = True):
+def process_utxo(db_chain, inputs, unmark = False, with_log = True, no_modify_exit = False):
     processed_utxo = 0
     processed_modified = 0
     processed_total = 0
@@ -628,6 +628,8 @@ def process_utxo(db_chain, inputs, unmark = False, with_log = True):
                 if with_log:
                     logging.info("utxo: set output-tx-id=%s, output-idx=%s, spent-tx=%s, spent-id=%s", belong_tx_id, output_index, spend_tx_id, input_id)
         processed_utxo += 1
+        if no_modify_exit and processed_utxo != processed_modified:
+            break
     if processed_utxo > 0 and with_log:
         logging.info('utxo: %s/%s outputs has been spent' %(processed_utxo, processed_total))
     return (processed_modified, processed_utxo, processed_total)
