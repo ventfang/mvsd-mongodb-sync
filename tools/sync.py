@@ -436,6 +436,13 @@ def get_last_height(db_chain):
         , max_output_id.next()['output_id'] + 1 if max_output_id.count() > 0 else 0\
         , max_input_id.next()['input_id'] + 1if max_input_id.count() > 0 else 0
 
+def get_last_block_inputs(db_chain):
+    block_height = db_chain.block.aggregate([{"$group":{"_id": "max-height","max_height":{"$max":"$number"}}}]).next()["max_height"]
+    latest_block_tx_ids_cur = db_chain.transaction.find({"block_height":block_height})
+    latest_block_tx_ids = [txs['tx_id'] for txs in latest_block_tx_ids_cur]
+    latest_block_inputs = db_chain.input.find({"tx_id":{"$in":latest_block_tx_ids}})
+
+    return block_height, len(latest_block_tx_ids), latest_block_inputs
 
 def clear_fork(db_chain, fork_height):
     blocks = db_chain.block.find({'number':{'$gte':fork_height}})
@@ -536,6 +543,12 @@ def workaholic(stopped):
         return
         db_chain_.batch.remove(batch_info)
 
+    # check latest block inputs spend outputs
+    logging.info("======================== utxo check ======================")
+    int_block_height, int_block_txs, int_inputs = get_last_block_inputs(db_chain)
+    processed_modified, processed_utxo, processed_total = process_utxo(db_chain, int_inputs, with_log = False)
+    logging.info("utxo: %s inputs in %s txs at block %s, %s/%s/%s(modified/proessed/total) outputs processed at startup." %(int_inputs.count(), int_block_txs, int_block_height, processed_modified, processed_utxo, processed_total))
+
     addresses = latest_addresses(db_chain)
 
     while not stopped():
@@ -585,8 +598,9 @@ def do_fork(args):
     db_chain = new_mongo(mongodb_host, mongodb_port, db_name)
     clear_fork(db_chain, int(args[0]))
 
-def process_utxo(db_chain, inputs, unmark = False):
+def process_utxo(db_chain, inputs, unmark = False, with_log = True):
     processed_utxo = 0
+    processed_modified = 0
     processed_total = 0
     for input in inputs:
         processed_total += 1
@@ -599,7 +613,8 @@ def process_utxo(db_chain, inputs, unmark = False):
         asset_type = input.get('asset', '')
         if unmark == True:
             db_chain.output.update({"tx_id":belong_tx_id, "index":output_index, "asset":asset_type}, {"$unset":{"spent":1, "spent_in":1}})
-            logging.info("utxo: unset output-tx-id=%s, output-idx=%s", belong_tx_id, output_index)
+            if with_log:
+                logging.info("utxo: unset output-tx-id=%s, output-idx=%s", belong_tx_id, output_index)
         else:
             spend_tx_id = input.get('tx_id', -1)
             input_id = input.get('input_id', -1)
@@ -607,13 +622,18 @@ def process_utxo(db_chain, inputs, unmark = False):
             spend_tx_hash = null_hash if spend_tx_hash_cursor.count() != 1 else spend_tx_hash_cursor[0]["hash"]
             result = db_chain.output.update({"tx_id":belong_tx_id, "index":output_index, "asset":asset_type}, \
                 {"$set":{"spent":True, "spent_in":{"hash":spend_tx_hash, "input_id":spend_tx_id}}})
+            
             if type(result) == dict and result.get('nModified', 0) != 1:
-                logging.warn("utxo: set output-tx-id=%s, output-idx=%s, spent-tx=%s, spent-id=%s, result=%s", belong_tx_id, output_index, spend_tx_id, input_id, result)
+                if with_log:
+                    logging.warn("utxo: set output-tx-id=%s, output-idx=%s, spent-tx=%s, spent-id=%s, result=%s", belong_tx_id, output_index, spend_tx_id, input_id, result)
             else:
-                logging.info("utxo: set output-tx-id=%s, output-idx=%s, spent-tx=%s, spent-id=%s", belong_tx_id, output_index, spend_tx_id, input_id)
+                processed_modified += 1
+                if with_log:
+                    logging.info("utxo: set output-tx-id=%s, output-idx=%s, spent-tx=%s, spent-id=%s", belong_tx_id, output_index, spend_tx_id, input_id)
         processed_utxo += 1
-    if processed_utxo > 0:
+    if processed_utxo > 0 and with_log:
         logging.info('utxo: %s/%s outputs has been spent' %(processed_utxo, processed_total))
+    return (processed_modified, processed_utxo, processed_total)
 
 def do_utxo(args):
     db_chain = new_mongo(mongodb_host, mongodb_port, db_name)
