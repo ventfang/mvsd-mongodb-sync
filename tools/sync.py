@@ -27,7 +27,7 @@ mongodb_port = int(os.environ['MONGO_PORT'])
 db_name = os.environ['MONGO_DB']
 
 # Setup Mvsd connection
-rpc_uri = 'http://%s:%s/rpc' % (os.environ['MVSD_HOST'], os.environ['MVSD_PORT'])
+rpc_uri = 'http://%s:%s/rpc/v2' % (os.environ['MVSD_HOST'], os.environ['MVSD_PORT'])
 
 ######global asset######
 global_asset = {}
@@ -70,7 +70,9 @@ class Boolean:
 class HeaderNotFound(Exception):
     def __init__(self, *args, **kwargs):
         Exception.__init__(self, *args, **kwargs)
-
+class JsonRpcError(Exception):
+    def __init__(self, *args, **kwargs):
+        Exception.__init__(self, *args, **kwargs)
 
 class TryException(Exception):
     def __init__(self, *args, **kwargs):
@@ -114,12 +116,23 @@ class RpcClient:
             raise RuntimeError('bad params type')
 
         cmd_ = cmd_.replace('_', '-')
-        content = {'method':cmd_, 'params':params}
+        content = {'jsonrpc':'2.0','id':1,'method':cmd_, 'params':params}
         resp = requests.post(self.__uri, data=json.dumps(content))
         if resp.status_code != 200:
             raise RuntimeError('bad request,%s' % resp.status_code)
 
-        return resp.text
+        try:
+            res = json.loads(resp.text)
+            if res.has_key('error') :
+                raise JsonRpcError(res['code'], res['message'])
+            if not res.has_key('result'):
+                raise JsonRpcError('Invalid JsonRpc response')
+            return res['result']
+        except JsonRpcError as e:
+            raise e
+        except Exception as e:
+            logging.info('RpcCLient exception: %s:%s, %s' % (cmd_, params, e.message))
+            raise JsonRpcError(e.message)
 
     def __getattr__(self, item):
         return lambda params:self.__request(item, params)
@@ -214,47 +227,32 @@ def rpc_network_check(func):
             res = func(*args, **kwargs)
         except Exception as e:
             global max_try
-            logging.info('try %s' % max_try)
+            logging.info('try %s, except: e' % (max_try, e.message))
             max_try -= 1
             if max_try <= 0:
                 raise RpcConnectionException('after 10 tries')
             raise TryException('try %s' % max_try)
-        if res.find('timed out') > 0:
-            raise RpcConnectionException('%s request failed,block height %s' % (func.__name__, 0))
         return res
     return wrapper
 
 
 @rpc_network_check
-def get_header(rpc, height):
-    return rpc.fetch_header(['-t', str(height)])
+def get_header(rpc, height_):
+    return rpc.getblockheader([{'height': height_}])
 
 
 @rpc_network_check
-def get_block(rpc, hash_, json_or_not = False):
-    return rpc.getblock([hash_, '--json=%s' % json_or_not])
+def get_block(rpc, height_):
+    return rpc.getblock([height_, {'json':True, 'tx_json':True}])
 
 
 def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
     new_txs = []
     addresses_ = {}
-    #for key in global_asset:
-    #   print(key, global_asset[key])
-    res = get_header(rpc, block_height)
-    try:
-        res = json.loads(res)
-        if res.get('error') is not None or res.get('result') is None:
-            raise HeaderNotFound('%s' % res)
-    except Exception as e:
-        logging.info('getheader json loads exception,%s,%s, %s' % (block_height, e, res))
-        raise HeaderNotFound('header %s not found' % block_height)
-    hash_ = res['result']['hash']
 
-    block_ = get_block(rpc, hash_, 'true')
-    block_ = json.loads(block_)
+    block_ = get_block(rpc, block_height)
 
     header = block_['header']['result']
-    header['number'] = int(header['number'])
     txs_ = block_['txs']['transactions']
     txs = [tx['hash'] for tx in txs_]
 
@@ -294,7 +292,7 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
         new_asset_pre = list(set(asset_pre))
         for i in inputs_:
             for a in new_asset_pre:
-                hashes.append((i['previous_output']['hash'], int(i['previous_output']['index']), a))
+                hashes.append((i['previous_output']['hash'], i['previous_output']['index'], a))
         hash_ids = input_hash_to_output_id(db_chain, hashes)
         new_inputs = []
         new_outputs = []
@@ -302,7 +300,7 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
             for a in new_asset_pre:
                 p = i['previous_output']
                 pre_hash = p['hash']
-                pre_index = int(p['index'])
+                pre_index = p['index']
                 hash_index = '%s_%s_%s' % (pre_hash, pre_index, a)
                 if pre_hash != null_hash and hash_index not in hash_ids and hash_index not in block_tx_output_value:
                     #raise CriticalException('previous output hash not found,%s', p)
@@ -323,12 +321,12 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
                 address_id = pre_ids[1]
                 tx_value = pre_ids[2]
                 asset = pre_ids[4]
-                decimal_number = pre_ids[5]
+                decimal_number = int(pre_ids[5])
                 lock_height_ = pre_ids[6]
                 inputs.append({'input_id': i_id, 'script': i['script'], 'belong_tx_id': pre_tx_id, 'tx_value': tx_value, 'address_id':address_id, 'output_index': pre_index, 'tx_id':tx_id, 'asset':asset, 'decimal_number':decimal_number})
                 i_id += 1
                 pre_address = i['address'] if i.get('address') is not None else ''
-                new_inputs.append({'address':pre_address, 'quantity':tx_value, 'type':'transfer', 'index':pre_ids[3], 'asset':{'symbol':asset, 'decimals':int(decimal_number)}, 'lock_height':lock_height_})
+                new_inputs.append({'address':pre_address, 'quantity':tx_value, 'type':'transfer', 'index':pre_ids[3], 'asset':{'symbol':asset, 'decimals':decimal_number}, 'lock_height':lock_height_})
 
         for o in outputs:
             if o.get('address') is None:
@@ -341,52 +339,51 @@ def sync_block(db_chain, block_height, tx_id, o_id, i_id, addresses, rpc):
                 addresses_[addr] = a_id
             else:
                 a_id = addresses[addr]
-            #block_tx_output_value['%s_%s' % (tx_hash, o['index'])] = (tx_id, a_id, int(o['value']), int(o['index']))
 
             if o['attachment']['type'] == 'asset-issue':
                 asset_name = o['attachment']['symbol']
-                asset_amount = int(o['attachment']['quantity'])
+                asset_amount = o['attachment']['quantity']
                 asset_type = o['attachment'].get('decimal_number') if o['attachment'].get('decimal_number') is not None else o['attachment']['asset_type']
                 global_asset[asset_name] = asset_type
                 asset_outs.append({'hash': tx_hash, 'address_id': a_id
                                       , 'output_id': o_id, 'value': asset_amount
-                                      , 'asset': asset_name, 'index': int(o['index']), 'tx_id': tx_id
+                                      , 'asset': asset_name, 'index': o['index'], 'tx_id': tx_id
                                       , 'description': o['attachment']['description']
-                                      , 'asset_type': asset_type,
+                                      , 'asset_type': str(asset_type),
                                    'issuer': o['attachment']['issuer']})
-                outs.append({'hash': tx_hash, 'address_id': a_id, 'decimal_number': int(asset_type),
+                outs.append({'hash': tx_hash, 'address_id': a_id, 'decimal_number': asset_type,
                              'script': o['script'], 'output_id': o_id, 'value': asset_amount, 'asset': asset_name,
-                             'index': int(o['index']), 'tx_id': tx_id})
+                             'index': o['index'], 'tx_id': tx_id})
                 block_tx_output_value['%s_%s_%s' % (tx_hash, o['index'], asset_name)] = (
-                tx_id, a_id, int(o['attachment']['quantity']), int(o['index']), asset_name,
+                tx_id, a_id, o['attachment']['quantity'], o['index'], asset_name,
                 asset_type, 0)
-                new_outputs.append({'address':o['address'], 'quantity':asset_amount, 'type':'issue', 'index':o['index'], 'asset':{'symbol':asset_name, 'decimals':int(asset_type)}, 'lock_height': 0})
+                new_outputs.append({'address':o['address'], 'quantity':asset_amount, 'type':'issue', 'index':o['index'], 'asset':{'symbol':asset_name, 'decimals':asset_type}, 'lock_height': 0})
                 if o['value'] == '0':
                     o_id += 1
                     continue
                 o_id += 1
             elif 'asset-transfer' == o['attachment']['type']:
                 asset_name = o['attachment']['symbol']
-                asset_amount = int(o['attachment']['quantity'])
+                asset_amount = o['attachment']['quantity']
                 asset_type = global_asset[asset_name]
                 asset_pre.append(asset_name)
                 outs.append({'hash': tx_hash, 'address_id': a_id, 'script': o['script'], 'output_id': o_id,
                              'value': asset_amount
-                                , 'asset': asset_name, 'index': int(o['index']), 'tx_id': tx_id,
+                                , 'asset': asset_name, 'index': o['index'], 'tx_id': tx_id,
                              'decimal_number': global_asset[asset_name]})
                 block_tx_output_value['%s_%s_%s' % (tx_hash, o['index'], asset_name)] = (
-                    tx_id, a_id, int(asset_amount), int(o['index']), asset_name, global_asset[asset_name], 0)
+                    tx_id, a_id, asset_amount, o['index'], asset_name, global_asset[asset_name], 0)
                 o_id += 1
-                new_outputs.append({'address':o['address'], 'quantity':asset_amount, 'type':'transfer', 'index':o['index'], 'asset':{'symbol':asset_name, 'decimals':int(asset_type)}, 'lock_height': 0})
+                new_outputs.append({'address':o['address'], 'quantity':asset_amount, 'type':'transfer', 'index':o['index'], 'asset':{'symbol':asset_name, 'decimals':asset_type}, 'lock_height': 0})
                 if o['value'] == '0':
                     continue
             asset_name = 'ETP'
             outs.append(
-                {'hash': tx_hash, 'address_id': a_id, 'script': o['script'], 'output_id': o_id, 'value': int(o['value']),
-                 'asset': asset_name, 'index': int(o['index']), 'tx_id': tx_id, 'decimal_number': '8'})
+                {'hash': tx_hash, 'address_id': a_id, 'script': o['script'], 'output_id': o_id, 'value': o['value'],
+                 'asset': asset_name, 'index': o['index'], 'tx_id': tx_id, 'decimal_number': 8})
             lock_height = parse_lock_height(o['script'])
             block_tx_output_value['%s_%s_%s' % (tx_hash, o['index'], asset_name)] = (
-                tx_id, a_id, int(o['value']), int(o['index']), asset_name, '8', lock_height)
+                tx_id, a_id, o['value'], o['index'], asset_name, 8, lock_height)
 
             new_outputs.append({'address': '' if o.get('address') is None else o['address'], 'quantity':o['value'], 'type':'transfer', 'index':o['index'], 'asset':{'symbol':'ETP', 'decimals':8}, 'lock_height': lock_height})
             o_id += 1
@@ -472,11 +469,8 @@ def process_fork(db_chain, rpc, current_height):
     while True:
         try:
             header = get_header(rpc, height)
-            header = json.loads(header)
             hash = header['result']['hash']
 
-            # if height % 10 == 9:
-            #     hash = 'fuck'
             existed = check_block(hash)
             if not existed:
                 fork_height = height
@@ -558,6 +552,10 @@ def workaholic(stopped):
             pass
         except HeaderNotFound as e:
             logging.info('header not found except,%s' % e)
+            time.sleep(24)
+            continue
+        except JsonRpcError as e:
+            logging.info('Json Rpc except: %s' % e)
             time.sleep(24)
             continue
         except RpcConnectionException as e:
